@@ -82,6 +82,30 @@ SCRIPT: list[tuple[int, str, bool, bool, int]] = [
     (900, "please search", False, False, 6),
     (300, "please search for the latest ai news", False, False, 6),
     (300, "please search for the latest ai news", True, True, 6),  # <- fires here (no named target)
+
+    # Punctuation/casing Deepgram's smart-formatting can add, plus new app
+    # aliases (calculator, file explorer) - all handled by _normalize_transcript.
+    (900, "Hey,", False, False, 7),
+    (300, "Hey, can you open", False, False, 7),
+    (300, "Hey, can you open the calculator app", False, False, 7),  # <- fires here
+    (300, "Hey, can you open the calculator app, please!", True, True, 7),
+
+    (900, "open", False, False, 8),
+    (300, "open file explorer", False, False, 8),  # <- fires here
+    (300, "open file explorer", True, True, 8),
+
+    # Compound command: opens Chrome mid-sentence, then the trailing
+    # "search for ..." fires separately once finalized (regression test for
+    # _match_regex's dedup-aware scanning - open_app's "open chrome" match
+    # would otherwise keep "winning" on every later pass and hide the
+    # search entirely, since it's already fired and gets silently deduped).
+    (900, "open", False, False, 9),
+    (250, "open chrome", False, False, 9),  # <- fires here (open_app)
+    (250, "open chrome and", False, False, 9),
+    (250, "open chrome and search", False, False, 9),
+    (300, "open chrome and search for", False, False, 9),
+    (300, "open chrome and search for python tutorials", False, False, 9),
+    (300, "open chrome and search for python tutorials", True, True, 9),  # <- fires here (browser_search)
 ]
 
 

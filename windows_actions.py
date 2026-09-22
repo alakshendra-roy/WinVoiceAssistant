@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -37,19 +38,43 @@ _ARC_CANDIDATES = [
     Path(os.environ.get("PROGRAMFILES", "")) / "Arc" / "Arc.exe",
 ]
 
+_CHROME_CANDIDATES = [
+    Path(os.environ.get("PROGRAMFILES", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+    Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+]
+
+# Every key resolves to one of the handler branches in open_app() below.
+# Multi-word phrases ("notes app", "file explorer") are matched here for
+# direct resolve_app() lookups (e.g. from the LLM fallback); the regex path
+# in intent_engine.py already matches them via its own word-boundary
+# patterns without needing the exact multi-word key.
 _APP_ALIASES = {
     "notes": "notepad",
     "note": "notepad",
+    "notes app": "notepad",
     "notepad": "notepad",
     "terminal": "terminal",
     "cmd": "terminal",
     "console": "terminal",
     "arc": "arc",
+    "browser": "browser",
+    "chrome": "chrome",
+    "google chrome": "chrome",
     "x": "x",
     "twitter": "x",
     "camera": "camera",
     "photo booth": "camera",
     "photobooth": "camera",
+    "calculator": "calc",
+    "calc": "calc",
+    "code": "code",
+    "vs code": "code",
+    "vscode": "code",
+    "visual studio code": "code",
+    "file explorer": "explorer",
+    "explorer": "explorer",
+    "files": "explorer",
 }
 
 
@@ -71,11 +96,14 @@ def _open_browser(url: str) -> None:
     if DRY_RUN:
         print(f"[DRY_RUN] would open in default browser: {url}")
         return
-    webbrowser.open(url)
+    webbrowser.open_new_tab(url)
 
 
 def resolve_app(name: str) -> str:
-    key = name.strip().lower()
+    # Multi-word aliases ("visual studio code", "file explorer") are matched
+    # by regex with \s+ between words, so whitespace can vary - collapse it
+    # before the exact-string dict lookup.
+    key = re.sub(r"\s+", " ", name.strip().lower())
     if key not in _APP_ALIASES:
         raise ActionError(f"Unknown app alias: {name!r}")
     return _APP_ALIASES[key]
@@ -106,6 +134,22 @@ def open_app(app_name: str) -> str:
         _open_browser("https://arc.net")
         return "Arc not found, opening arc.net instead"
 
+    if resolved == "chrome":
+        for candidate in _CHROME_CANDIDATES:
+            if candidate.exists():
+                _run([str(candidate)])
+                return "Opening Chrome"
+        exe = shutil.which("chrome")
+        if exe:
+            _run([exe])
+            return "Opening Chrome"
+        _open_browser("about:blank")
+        return "Chrome not found, opening default browser instead"
+
+    if resolved == "browser":
+        _open_browser("about:blank")
+        return "Opening browser"
+
     if resolved == "x":
         navigate_url("https://x.com")
         return "Opening X"
@@ -113,6 +157,21 @@ def open_app(app_name: str) -> str:
     if resolved == "camera":
         _run("microsoft.windows.camera:")
         return "Opening Camera"
+
+    if resolved == "calc":
+        _run(["calc.exe"])
+        return "Opening Calculator"
+
+    if resolved == "code":
+        exe = shutil.which("code.cmd") or shutil.which("code")
+        if exe:
+            _run([exe])
+            return "Opening VS Code"
+        raise ActionError("VS Code ('code') not found on PATH")
+
+    if resolved == "explorer":
+        _run(["explorer.exe"])
+        return "Opening File Explorer"
 
     raise ActionError(f"No handler registered for resolved app: {resolved}")
 
@@ -162,10 +221,15 @@ def _escape_for_send_keys(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _BROWSER_COMMANDS = {
-    "chrome": "chrome",
     "edge": "msedge",
     "firefox": "firefox",
-    "arc": "arc",
+}
+
+# Browsers that aren't reliably on PATH get an explicit install-path search,
+# same as open_app()'s _ARC_CANDIDATES/_CHROME_CANDIDATES.
+_BROWSER_CANDIDATES = {
+    "arc": _ARC_CANDIDATES,
+    "chrome": _CHROME_CANDIDATES,
 }
 
 
@@ -176,8 +240,9 @@ def _open_url_in_browser(url: str, browser: str = "default") -> None:
         _open_browser(url)
         return
 
-    if browser == "arc":
-        for candidate in _ARC_CANDIDATES:
+    candidates = _BROWSER_CANDIDATES.get(browser)
+    if candidates is not None:
+        for candidate in candidates:
             if candidate.exists():
                 _run([str(candidate), url])
                 return

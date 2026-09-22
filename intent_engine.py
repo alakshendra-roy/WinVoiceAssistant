@@ -40,7 +40,16 @@ class Action:
 # "notes?" can't match the "notepad" substring because \b after it fails
 # ("notepad" has no word boundary between "note" and "pad") - this was why
 # "open up notepad" previously matched nothing at all.
-_APP_WORDS = r"(notepad|notes?|arc|terminal|console|cmd|x|twitter|camera|photo\s?booth)"
+#
+# Multi-word phrases ("visual studio code", "file explorer") must appear as
+# their own alternative, not be assembled from shorter ones: alternation is
+# tried at a fixed starting position (right after the trigger word), so
+# "code" alone never matches when the first word there is actually "visual".
+_APP_WORDS = (
+    r"(notepad|notes?|arc|terminal|console|cmd|browser|chrome|x|twitter|"
+    r"camera|photo\s?booth|calculator|calc|visual\s+studio\s+code|"
+    r"vs\s+code|vscode|code|file\s+explorer|explorer|files)"
+)
 
 # Matches "open <app>", "open up <app>", "open the <app>", "launch <app>",
 # and "pull up <app>" (with an optional "the" in between). All patterns use
@@ -49,6 +58,11 @@ _APP_WORDS = r"(notepad|notes?|arc|terminal|console|cmd|x|twitter|camera|photo\s
 _OPEN_TRIGGER = r"(?:open(?:\s+(?:the|up))?|launch(?:\s+the)?|pull\s+up(?:\s+the)?)"
 
 _KNOWN_SEARCH_TARGETS = r"(chrome|edge|arc|firefox|google|x|twitter)"
+
+# Allows an optional comma/colon right after "write" ("write, hello world"),
+# since that's exactly the shape smart-formatted STT punctuation can produce
+# between an imperative verb and its content.
+_WRITE_PATTERN = re.compile(r"\bwrite\b[,:]?\s*(.+?)(?:[.!?]|$)", re.IGNORECASE)
 
 _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     (
@@ -89,6 +103,26 @@ _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
 # done speaking (speech_final), using the final, complete text.
 _FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     (
+        # "open <browser> and search <query>" - ties the search to the named
+        # browser. Tried before the generic "search ..." pattern below,
+        # which would otherwise still match the "search <query>" tail of
+        # this same phrase but silently ignore that a browser was named and
+        # fall back to "default" instead of actually using it.
+        re.compile(
+            rf"\bopen\s+{_KNOWN_SEARCH_TARGETS}\s+and\s+search\s+(?:for\s+)?(.+?)(?:[.!?]|$)",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="browser_search",
+            signature=f"browser_search:{m.group(1).lower()}:{m.group(2).lower()}",
+            run=lambda: wa.browser_search(
+                query=m.group(2).strip(),
+                browser="default" if m.group(1).lower() == "google" else m.group(1).strip(),
+            ),
+            display_arg=m.group(2),
+        ),
+    ),
+    (
         # Explicit target named: "search <chrome/arc/x/...> for <query>".
         # "google" is accepted here too even though it isn't a browser app -
         # browser_search always searches via Google regardless, so it just
@@ -119,7 +153,7 @@ _FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
     ),
     (
-        re.compile(r"\bwrite\s+(.+?)(?:[.!?]|$)", re.IGNORECASE),
+        _WRITE_PATTERN,
         lambda m: Action(
             name="write_in_app",
             signature="write_in_app",
@@ -127,6 +161,19 @@ _FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
     ),
 ]
+
+# Strips conversational punctuation Deepgram's smart-formatting can add
+# ("Open the notes app, please!") before regex matching. Deliberately
+# leaves '.', ':', '/', '-' untouched - those are load-bearing for
+# navigate_url's domain-token detection (e.g. "github.com"); stripping all
+# punctuation indiscriminately would break that instead of helping.
+_STRIP_CHARS_PATTERN = re.compile(r"[,;!?\"'`]")
+
+
+def _normalize_transcript(text: str) -> str:
+    normalized = _STRIP_CHARS_PATTERN.sub("", text.lower())
+    return re.sub(r"\s+", " ", normalized).strip()
+
 
 # Bracketed, uppercase confirmation-badge style, e.g. "[LAUNCHED NOTEPAD]".
 _ACTION_LABELS = {
@@ -138,16 +185,30 @@ _ACTION_LABELS = {
 }
 
 
-def _match_regex(text: str, speech_final: bool) -> Optional[Action]:
+def _match_regex(text: str, speech_final: bool, already_fired: Callable[[str], bool]) -> Optional[Action]:
+    """Returns the first NEW (not already-fired) action found.
+
+    A match whose signature already fired earlier in this utterance is
+    skipped rather than returned - otherwise a compound command like "open
+    chrome and search for python tutorials" would never get past its own
+    "open chrome" prefix: that substring always matches open_app first, and
+    once it has already fired, returning it again just gets silently
+    deduped one level up, so the trailing "search for ..." is never even
+    considered on the same call.
+    """
     for pattern, build in _PATTERNS:
         match = pattern.search(text)
         if match:
-            return build(match)
+            action = build(match)
+            if not already_fired(action.signature):
+                return action
     if speech_final:
         for pattern, build in _FINAL_ONLY_PATTERNS:
             match = pattern.search(text)
             if match:
-                return build(match)
+                action = build(match)
+                if not already_fired(action.signature):
+                    return action
     return None
 
 
@@ -277,9 +338,17 @@ class IntentEngine:
         self._fired.setdefault(utterance_id, set()).add(signature)
 
     def on_transcript(self, text: str, is_final: bool, speech_final: bool, utterance_id: int) -> None:
-        action = _match_regex(text, speech_final)
-        if action is None and self._llm is not None and (is_final or len(text.split()) >= 4):
-            action = self._llm.classify(text)
+        # Lowercased/punctuation-stripped for trigger matching only - see
+        # _normalize_transcript. Casing/punctuation doesn't matter for any
+        # of the other captured args (Google search is case-insensitive,
+        # and confirmation badges are uppercased anyway), so this is safe
+        # everywhere except write_in_app's dictated content, handled below.
+        normalized = _normalize_transcript(text)
+
+        already_fired = lambda sig: self._already_fired(utterance_id, sig)  # noqa: E731
+        action = _match_regex(normalized, speech_final, already_fired)
+        if action is None and self._llm is not None and (is_final or len(normalized.split()) >= 4):
+            action = self._llm.classify(normalized)
 
         if action is None:
             return
@@ -288,6 +357,19 @@ class IntentEngine:
         # transcript, regardless of which matcher (regex or LLM) found it.
         if action.name in ("write_in_app", "browser_search") and not speech_final:
             return
+
+        if action.name == "write_in_app":
+            # Re-extract from the ORIGINAL text: typing everything in
+            # lowercase with punctuation stripped would be a real
+            # regression for dictated notes, unlike the other actions.
+            original_match = _WRITE_PATTERN.search(text)
+            if original_match:
+                original_content = original_match.group(1).strip()
+                action = Action(
+                    name="write_in_app",
+                    signature="write_in_app",
+                    run=lambda: wa.write_in_app(original_content),
+                )
         if self._already_fired(utterance_id, action.signature):
             return
 
