@@ -95,9 +95,22 @@ class PillOverlay(QWidget):
     def _reverse_pulse(self) -> None:
         # QPropertyAnimation with loopCount(-1) already loops start->end; we
         # ping-pong manually so the glow breathes in and out.
-        start, end = self._pulse_anim.startValue(), self._pulse_anim.endValue()
+        #
+        # The `finished` signal can still be delivered from Qt's queue during
+        # app teardown, after the animation's underlying C++ object has
+        # already been deleted (closeEvent's stop() only prevents *new*
+        # emissions, not ones already queued) — accessing it then raises
+        # RuntimeError: wrapped C/C++ object ... has been deleted.
+        try:
+            start, end = self._pulse_anim.startValue(), self._pulse_anim.endValue()
+        except RuntimeError:
+            return
         self._pulse_anim.setStartValue(end)
         self._pulse_anim.setEndValue(start)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._pulse_anim.stop()
+        super().closeEvent(event)
 
     # -- public API (called from the intent/voice pipeline) ----------------
 
