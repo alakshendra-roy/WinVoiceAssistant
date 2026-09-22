@@ -5,14 +5,20 @@ The floating "pill" overlay: a frameless, translucent, always-on-top widget
 pinned to the top-center of the primary monitor. It never steals keyboard
 focus from whatever app the user is working in.
 
+Hidden by default - it's only revealed when PTT engages or a wake word is
+heard (flash_active()), and auto-hides again shortly after listening stops
+or an action's confirmation badge has had its moment on screen. Right-click
+for a "Hide" / "Exit Assistant" menu.
+
 States:
-    idle       - small pill, dim ambient pulse (may show a hotkey hint)
+    idle       - small pill, dim ambient pulse (may show a hotkey hint) -
+                 hides itself shortly after, unless an action just fired
     active     - wake word / push-to-talk just engaged: instant vivid cyan
                  pop with an "ANIMUS LISTENING" badge, no ramp-up
     listening  - same cyan accent, waiting for the first words
     streaming  - pill widens to show the live interim transcript
     action     - an emerald confirmation badge (e.g. "[LAUNCHED ARC]") is
-                 shown, then fades back to idle/streaming
+                 shown, then the pill auto-hides
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ from enum import Enum, auto
 
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSlot
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QFont, QFontMetrics
-from PyQt6.QtWidgets import QWidget, QApplication
+from PyQt6.QtWidgets import QApplication, QMenu, QWidget
 
 PILL_HEIGHT = 44
 PILL_MIN_WIDTH = 140
@@ -36,7 +42,8 @@ IDLE_COLOR = QColor(120, 170, 255, 255)  # dim ambient blue while asleep
 CYAN_ACCENT = QColor(0, 229, 255, 255)  # vivid neon cyan while actively listening
 EMERALD_COLOR = QColor(0, 224, 122, 255)  # confirmation-badge green
 
-ACTION_BADGE_LIFETIME_MS = 2200
+ACTION_BADGE_LIFETIME_MS = 1500
+IDLE_HIDE_DELAY_MS = 300
 ACTIVE_POP_HINT = "ANIMUS LISTENING"
 
 
@@ -81,13 +88,14 @@ class PillOverlay(QWidget):
         self._pulse_anim.finished.connect(self._reverse_pulse)
         self._pulse_direction_up = True
 
-        self._action_timer = QTimer(self)
-        self._action_timer.setSingleShot(True)
-        self._action_timer.timeout.connect(self._clear_action)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
 
         self._resize_to_content()
         self._reposition()
         self._pulse_anim.start()
+        self.hide()  # only revealed on PTT engage / wake word - see flash_active()
 
     # -- glow property (animated) -----------------------------------------
 
@@ -120,6 +128,17 @@ class PillOverlay(QWidget):
         self._pulse_anim.stop()
         super().closeEvent(event)
 
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt override
+        menu = QMenu(self)
+        hide_action = menu.addAction("Hide")
+        exit_action = menu.addAction("Exit Assistant")
+        chosen = menu.exec(event.globalPos())
+        if chosen == hide_action:
+            self._hide_timer.stop()
+            self.hide()
+        elif chosen == exit_action:
+            QApplication.instance().quit()
+
     # -- public API (called from the intent/voice pipeline) ----------------
 
     def set_idle_hint(self, hint: str) -> None:
@@ -132,18 +151,36 @@ class PillOverlay(QWidget):
     @pyqtSlot(str)
     def flash_active(self, hint: str = ACTIVE_POP_HINT) -> None:
         """Wake word detected / PTT engaged: pop straight to full cyan glow,
-        no ramp-up, so the reaction reads as instant rather than animated."""
+        no ramp-up, so the reaction reads as instant rather than animated.
+
+        Reveals the pill (hidden by default) and cancels any pending
+        auto-hide, so re-engaging never races a stale hide() from a
+        previous cycle into hiding the pill right after it's shown again.
+        """
+        self._hide_timer.stop()
         self._active_hint = hint
         self._state = PillState.ACTIVE
         self._glow = 1.0
         self._resize_to_content()
+        self.show()
         self.update()
 
     @pyqtSlot(bool)
     def set_listening(self, listening: bool) -> None:
-        self._state = PillState.LISTENING if listening else PillState.IDLE
-        if not listening:
+        if listening:
+            self._hide_timer.stop()
+            self._state = PillState.LISTENING
+            self.show()
+        else:
             self._transcript = ""
+            if self._state == PillState.ACTION:
+                # An action badge is currently showing (and already has its
+                # own hide timer running via show_action) - don't cut its
+                # display short just because listening stopped.
+                pass
+            else:
+                self._state = PillState.IDLE
+                self._hide_timer.start(IDLE_HIDE_DELAY_MS)
         self._resize_to_content()
         self.update()
 
@@ -156,16 +193,13 @@ class PillOverlay(QWidget):
 
     @pyqtSlot(str)
     def show_action(self, label: str) -> None:
+        self._hide_timer.stop()
         self._action_label = label
         self._state = PillState.ACTION
         self._resize_to_content()
+        self.show()
         self.update()
-        self._action_timer.start(ACTION_BADGE_LIFETIME_MS)
-
-    def _clear_action(self) -> None:
-        self._state = PillState.STREAMING if self._transcript else PillState.IDLE
-        self._resize_to_content()
-        self.update()
+        self._hide_timer.start(ACTION_BADGE_LIFETIME_MS)
 
     # -- layout --------------------------------------------------------
 

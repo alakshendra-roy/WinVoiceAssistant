@@ -59,10 +59,53 @@ _OPEN_TRIGGER = r"(?:open(?:\s+(?:the|up))?|launch(?:\s+the)?|pull\s+up(?:\s+the
 
 _KNOWN_SEARCH_TARGETS = r"(chrome|edge|arc|firefox|google|x|twitter)"
 
+# Only treats '.', '!', '?' as an end-of-utterance marker when followed by
+# whitespace or end-of-string - NOT when embedded mid-word, as in a domain
+# like "github.com". Without the lookahead, "search for python tutorials on
+# github.com" would capture just "...github" and drop ".com", since the
+# non-greedy capture stops at the first '.' it sees regardless of context.
+_SENTENCE_END = r"(?:[.!?](?=\s|$)|$)"
+
 # Allows an optional comma/colon right after "write" ("write, hello world"),
 # since that's exactly the shape smart-formatted STT punctuation can produce
 # between an imperative verb and its content.
-_WRITE_PATTERN = re.compile(r"\bwrite\b[,:]?\s*(.+?)(?:[.!?]|$)", re.IGNORECASE)
+_WRITE_PATTERN = re.compile(rf"\bwrite\b[,:]?\s*(.+?){_SENTENCE_END}", re.IGNORECASE)
+
+# Spoken URLs ("animus infra dot com", "github dot com") say "dot" as a word
+# instead of an actual period, so the literal-dot pattern below never
+# matches them at all. TLD list is deliberately short and common rather than
+# exhaustive - it only needs to cover realistic spoken commands.
+_TLDS = r"com|io|net|org|dev|co|ai|app|info|biz|me|us|uk|in|edu|gov|xyz|tv|so"
+
+_LITERAL_DOMAIN_FULL = re.compile(rf"[a-z0-9][\w-]*(?:\.[a-z0-9][\w-]*)*\.(?:{_TLDS})", re.IGNORECASE)
+_SPOKEN_DOMAIN_FULL = re.compile(
+    rf"(?:[a-z0-9-]+\s+){{0,3}}[a-z0-9-]+\s+dot\s+(?:{_TLDS})(?:\s+dot\s+(?:{_TLDS}))*", re.IGNORECASE
+)
+
+
+def _despeak_dots(raw: str) -> str:
+    """"animus infra dot com" -> "animusinfra.com". A no-op on text that
+    already has a literal dot and no spaces, so it's safe to apply
+    unconditionally regardless of which alternative actually matched."""
+    return re.sub(r"\s+dot\s+", ".", raw, flags=re.IGNORECASE).replace(" ", "")
+
+
+def _looks_like_domain(text: str) -> Optional[str]:
+    """If `text`, in full, is just a domain - spoken or literal - with
+    nothing else around it, returns the normalized domain. Used to route a
+    "search <query>" whose entire query is a bare domain to navigate_url
+    instead of Googling the literal words. Deliberately requires a full
+    match (not a search anywhere in the string): "search for python
+    tutorials on github.com" should still be a real Google search, not a
+    navigation, just because a domain is mentioned somewhere in it.
+    """
+    candidate = text.strip()
+    if _SPOKEN_DOMAIN_FULL.fullmatch(candidate):
+        return _despeak_dots(candidate)
+    if _LITERAL_DOMAIN_FULL.fullmatch(candidate):
+        return candidate.replace(" ", "")
+    return None
+
 
 _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     (
@@ -75,12 +118,21 @@ _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
     ),
     (
-        re.compile(r"\b(?:navigate to|go to)\s+([a-z0-9][\w.\-/:]*\.[a-z]{2,}[\w.\-/]*)", re.IGNORECASE),
+        # Accepts both a literal-dot domain ("github.com") and a spoken one
+        # ("animus infra dot com") - _despeak_dots is applied unconditionally
+        # since it's a no-op on text that's already a proper literal domain.
+        re.compile(
+            rf"\b(?:navigate to|go to)\s+("
+            rf"(?:[a-z0-9-]+\s+){{1,3}}dot\s+(?:{_TLDS})(?:\s+dot\s+(?:{_TLDS}))*"
+            rf"|[a-z0-9][\w.\-/:]*\.[a-z]{{2,}}[\w.\-/]*"
+            rf")",
+            re.IGNORECASE,
+        ),
         lambda m: Action(
             name="navigate_url",
-            signature=f"navigate_url:{m.group(1).lower()}",
-            run=lambda: wa.navigate_url(m.group(1)),
-            display_arg=m.group(1),
+            signature=f"navigate_url:{_despeak_dots(m.group(1)).lower()}",
+            run=lambda: wa.navigate_url(_despeak_dots(m.group(1))),
+            display_arg=_despeak_dots(m.group(1)),
         ),
     ),
     (
@@ -101,6 +153,48 @@ _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
 # signature and were all three observed firing as separate browser searches
 # during live testing. Both are only matched once the utterance is actually
 # done speaking (speech_final), using the final, complete text.
+
+
+def _build_targeted_search(m: re.Match) -> Action:
+    query = m.group(2).strip()
+    domain = _looks_like_domain(query)
+    if domain:
+        # "search github.com" / "search github dot com" - the whole query is
+        # just a domain, so the user almost certainly means "go there", not
+        # "Google the literal text 'github.com'".
+        return Action(
+            name="navigate_url",
+            signature=f"navigate_url:{domain.lower()}",
+            run=lambda: wa.navigate_url(domain),
+            display_arg=domain,
+        )
+    browser = "default" if m.group(1).lower() == "google" else m.group(1).strip()
+    return Action(
+        name="browser_search",
+        signature=f"browser_search:{m.group(1).lower()}:{query.lower()}",
+        run=lambda: wa.browser_search(query=query, browser=browser),
+        display_arg=query,
+    )
+
+
+def _build_generic_search(m: re.Match) -> Action:
+    query = m.group(1).strip()
+    domain = _looks_like_domain(query)
+    if domain:
+        return Action(
+            name="navigate_url",
+            signature=f"navigate_url:{domain.lower()}",
+            run=lambda: wa.navigate_url(domain),
+            display_arg=domain,
+        )
+    return Action(
+        name="browser_search",
+        signature=f"browser_search:default:{query.lower()}",
+        run=lambda: wa.browser_search(query=query, browser="default"),
+        display_arg=query,
+    )
+
+
 _FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     (
         # "open <browser> and search <query>" - ties the search to the named
@@ -109,7 +203,7 @@ _FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         # this same phrase but silently ignore that a browser was named and
         # fall back to "default" instead of actually using it.
         re.compile(
-            rf"\bopen\s+{_KNOWN_SEARCH_TARGETS}\s+and\s+search\s+(?:for\s+)?(.+?)(?:[.!?]|$)",
+            rf"\bopen\s+{_KNOWN_SEARCH_TARGETS}\s+and\s+search\s+(?:for\s+)?(.+?){_SENTENCE_END}",
             re.IGNORECASE,
         ),
         lambda m: Action(
@@ -128,29 +222,16 @@ _FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         # browser_search always searches via Google regardless, so it just
         # keeps "google" out of the captured query text below.
         re.compile(
-            rf"\bsearch\s+(?:in\s+|on\s+)?{_KNOWN_SEARCH_TARGETS}\s+for\s+(.+?)(?:[.!?]|$)",
+            rf"\bsearch\s+(?:in\s+|on\s+)?{_KNOWN_SEARCH_TARGETS}\s+for\s+(.+?){_SENTENCE_END}",
             re.IGNORECASE,
         ),
-        lambda m: Action(
-            name="browser_search",
-            signature=f"browser_search:{m.group(1).lower()}:{m.group(2).lower()}",
-            run=lambda: wa.browser_search(
-                query=m.group(2).strip(),
-                browser="default" if m.group(1).lower() == "google" else m.group(1).strip(),
-            ),
-            display_arg=m.group(2),
-        ),
+        _build_targeted_search,
     ),
     (
         # Natural phrasing with no named target: "search for <query>" or
         # just "search <query>" - defaults to the system's default browser.
-        re.compile(r"\bsearch\s+(?:for\s+)?(.+?)(?:[.!?]|$)", re.IGNORECASE),
-        lambda m: Action(
-            name="browser_search",
-            signature=f"browser_search:default:{m.group(1).lower()}",
-            run=lambda: wa.browser_search(query=m.group(1).strip(), browser="default"),
-            display_arg=m.group(1),
-        ),
+        re.compile(rf"\bsearch\s+(?:for\s+)?(.+?){_SENTENCE_END}", re.IGNORECASE),
+        _build_generic_search,
     ),
     (
         _WRITE_PATTERN,

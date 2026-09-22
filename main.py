@@ -95,8 +95,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    overlay = PillOverlay()
-    overlay.show()
+    overlay = PillOverlay()  # hidden by default - reveals itself on PTT/wake word
 
     bridge = VoicePipelineBridge()
 

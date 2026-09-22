@@ -180,19 +180,82 @@ def open_app(app_name: str) -> str:
 # Text injection
 # ---------------------------------------------------------------------------
 
+# Modifier virtual-key codes: generic + left/right variants for Alt, Ctrl, Shift.
+_MODIFIER_VKS = (0x12, 0xA4, 0xA5, 0x11, 0xA2, 0xA3, 0x10, 0xA0, 0xA1)
+_KEYEVENTF_KEYUP = 0x0002
+
+
+def _release_modifier_keys() -> None:
+    """Force-clears the OS's key-state for Alt/Ctrl/Shift.
+
+    Confirmed via live reproduction: if the PTT hold key (Right Alt) is
+    still logically down when keystrokes get injected right after, every
+    injected letter is read as an Alt+<letter> accelerator instead of typed
+    text - in a tabbed app like modern Notepad this drove File-menu/Open
+    behavior and pulled in unrelated recently-used files, not just opened a
+    menu. keybd_event KEYUP is sent unconditionally; releasing an
+    already-up key is a harmless no-op, so this is safe to call regardless
+    of actual physical key state.
+    """
+    for vk in _MODIFIER_VKS:
+        ctypes.windll.user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
+
+
+def _get_clipboard_text() -> Optional[str]:
+    import win32clipboard
+
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+                return win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+            return None
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        return None
+
+
+def _set_clipboard_text(text: str) -> None:
+    import win32clipboard
+
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
 def write_in_app(text: str, title: Optional[str] = None) -> str:
     """
-    Type `text` into the target app via keystroke injection.
+    Type `text` into the target app via clipboard-paste (Ctrl+V), not
+    character-by-character keystroke injection.
+
+    Clipboard-paste replaces the old SendKeys-style approach for two
+    reasons confirmed via live reproduction against a real Notepad window:
+    (1) if a modifier is still logically held when keys are injected, every
+    injected letter is read as an Alt+<letter> accelerator - a single
+    Ctrl+V is far less exposed to that than dozens of individual
+    keystrokes; (2) it types with 100% fidelity, with no risk of a
+    character in the dictated text (`%^+~{}()`) being misread as SendKeys
+    syntax.
 
     If `title` is given, focuses the first top-level window whose title
-    contains it (case-insensitive). Otherwise defaults to Notepad, launching
-    it fresh if no Notepad window is open.
+    contains it and pastes into whatever tab is currently active there.
+    Otherwise defaults to Notepad, launching it fresh if none is open, and
+    always opens a brand-new tab (Ctrl+T) before pasting - an ambient,
+    already-running Notepad window can have the user's own real files open
+    in other tabs, and we must never type into one of those by accident.
     """
     if DRY_RUN:
         print(f"[DRY_RUN] would type into {title or 'Notepad'}: {text!r}")
         return "Typed (dry run)"
 
     from pywinauto import Application, findwindows  # local import: optional dep
+
+    _release_modifier_keys()
+    time.sleep(0.15)  # let the OS settle the key-up before injecting anything
 
     target_title = title or "Notepad"
     matches = findwindows.find_windows(title_re=f".*{target_title}.*", top_level_only=True)
@@ -205,15 +268,38 @@ def write_in_app(text: str, title: Optional[str] = None) -> str:
         time.sleep(0.6)  # let the process create its main window
         window = app.top_window()
 
+    try:
+        import win32gui
+
+        win32gui.SetForegroundWindow(window.handle)
+    except Exception:
+        # Best-effort: Windows' foreground-lock can refuse this from a
+        # non-activating background process. set_focus() below is the
+        # primary mechanism and has its own internal fallback for that.
+        pass
     window.set_focus()
-    window.type_keys(_escape_for_send_keys(text), with_spaces=True, pause=0)
+    time.sleep(0.05)
+
+    if title is None:
+        window.type_keys("^t", pause=0)  # new blank tab - never paste into an ambient real file
+        time.sleep(0.15)
+
+    # Re-release right before injecting the paste itself: set_focus()/
+    # SetForegroundWindow can (on some Windows versions) synthesize their
+    # own Alt keypress internally to defeat the foreground-lock, so the
+    # earlier release alone isn't guaranteed to still hold by this point.
+    _release_modifier_keys()
+
+    previous_clipboard = _get_clipboard_text()
+    _set_clipboard_text(text)
+    try:
+        window.type_keys("^v", pause=0)
+        time.sleep(0.1)
+    finally:
+        if previous_clipboard is not None:
+            _set_clipboard_text(previous_clipboard)
+
     return "Typed text"
-
-
-def _escape_for_send_keys(text: str) -> str:
-    # pywinauto's type_keys treats {}()~+^%  as special modifier syntax.
-    special = "{}()~+^%"
-    return "".join(f"{{{c}}}" if c in special else c for c in text)
 
 
 # ---------------------------------------------------------------------------

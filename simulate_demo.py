@@ -106,6 +106,18 @@ SCRIPT: list[tuple[int, str, bool, bool, int]] = [
     (300, "open chrome and search for", False, False, 9),
     (300, "open chrome and search for python tutorials", False, False, 9),
     (300, "open chrome and search for python tutorials", True, True, 9),  # <- fires here (browser_search)
+
+    # Spoken URL: "dot" said as a word, not an actual period - despeaks to
+    # "animusinfra.com" and navigates directly instead of Googling the
+    # literal words "animus infra dot com".
+    (900, "go", False, False, 10),
+    (300, "go to", False, False, 10),
+    (300, "go to animus infra dot com", True, True, 10),  # <- fires here (navigate_url)
+
+    # A "search" whose entire query is just a domain should also navigate
+    # directly rather than Google-searching the domain name as text.
+    (900, "search", False, False, 11),
+    (300, "search for github dot com", True, True, 11),  # <- fires here (navigate_url, not browser_search)
 ]
 
 
