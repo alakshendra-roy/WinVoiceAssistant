@@ -43,6 +43,8 @@ _APP_WORDS = r"(notes?|arc|terminal|console|cmd|x|twitter|camera|photo\s?booth)"
 # without needing to appear in the pattern itself.
 _OPEN_TRIGGER = r"(?:open(?:\s+(?:the|up))?|pull\s+up(?:\s+the)?)"
 
+_KNOWN_SEARCH_TARGETS = r"(chrome|edge|arc|firefox|google|x|twitter)"
+
 _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     (
         re.compile(rf"\b{_OPEN_TRIGGER}\s+{_APP_WORDS}\b", re.IGNORECASE),
@@ -61,11 +63,31 @@ _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
     ),
     (
-        re.compile(r"\bsearch\s+(.+?)\s+for\s+(.+?)(?:[.!?]|$)", re.IGNORECASE),
+        # Explicit target named: "search <chrome/arc/x/...> for <query>".
+        # "google" is accepted here too even though it isn't a browser app -
+        # browser_search always searches via Google regardless, so it just
+        # keeps "google" out of the captured query text below.
+        re.compile(
+            rf"\bsearch\s+(?:in\s+|on\s+)?{_KNOWN_SEARCH_TARGETS}\s+for\s+(.+?)(?:[.!?]|$)",
+            re.IGNORECASE,
+        ),
         lambda m: Action(
             name="browser_search",
             signature=f"browser_search:{m.group(1).lower()}:{m.group(2).lower()}",
-            run=lambda: wa.browser_search(query=m.group(2).strip(), browser=m.group(1).strip()),
+            run=lambda: wa.browser_search(
+                query=m.group(2).strip(),
+                browser="default" if m.group(1).lower() == "google" else m.group(1).strip(),
+            ),
+        ),
+    ),
+    (
+        # Natural phrasing with no named target: "search for <query>" or
+        # just "search <query>" - defaults to the system's default browser.
+        re.compile(r"\bsearch\s+(?:for\s+)?(.+?)(?:[.!?]|$)", re.IGNORECASE),
+        lambda m: Action(
+            name="browser_search",
+            signature=f"browser_search:default:{m.group(1).lower()}",
+            run=lambda: wa.browser_search(query=m.group(1).strip(), browser="default"),
         ),
     ),
     (
