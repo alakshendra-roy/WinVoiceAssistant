@@ -23,6 +23,7 @@ a pyqtSignal before touching any widgets).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import queue
 from typing import Callable, Optional
@@ -93,34 +94,51 @@ class DeepgramStreamer:
         self._running = True
         utterance_id = 0
 
-        async with websockets.connect(url, additional_headers=headers) as ws:
-            mic.start()
+        # Start capturing *before* the network handshake, not after: in
+        # push-to-talk mode a fresh connection is opened on every hotkey
+        # press, and the handshake's round trip (plus TLS) can easily eat
+        # the first word or two of a short press-and-speak utterance if the
+        # mic only starts once connect() returns. Audio queues up locally in
+        # the meantime and sender() drains it as soon as the socket is up.
+        mic.start()
+        try:
+            async with websockets.connect(url, additional_headers=headers) as ws:
 
-            async def sender():
-                while self._running:
-                    chunk = await mic.get()
-                    await ws.send(chunk)
+                async def sender():
+                    while self._running:
+                        chunk = await mic.get()
+                        await ws.send(chunk)
 
-            async def receiver():
-                nonlocal utterance_id
-                async for message in ws:
-                    payload = json.loads(message)
-                    if payload.get("type") != "Results":
-                        continue
-                    alt = payload["channel"]["alternatives"][0]
-                    text = alt.get("transcript", "")
-                    if not text:
-                        continue
-                    is_final = payload.get("is_final", False)
-                    speech_final = payload.get("speech_final", False)
-                    on_transcript(text, is_final, speech_final, utterance_id)
-                    if speech_final:
-                        utterance_id += 1
+                async def receiver():
+                    nonlocal utterance_id
+                    async for message in ws:
+                        payload = json.loads(message)
+                        if payload.get("type") != "Results":
+                            continue
+                        alt = payload["channel"]["alternatives"][0]
+                        text = alt.get("transcript", "")
+                        if not text:
+                            continue
+                        is_final = payload.get("is_final", False)
+                        speech_final = payload.get("speech_final", False)
+                        on_transcript(text, is_final, speech_final, utterance_id)
+                        if speech_final:
+                            utterance_id += 1
 
-            try:
-                await asyncio.gather(sender(), receiver())
-            finally:
-                mic.stop()
+                receiver_task = asyncio.ensure_future(receiver())
+                try:
+                    await sender()  # returns as soon as stop() flips self._running
+                finally:
+                    # Close immediately rather than waiting for Deepgram's own
+                    # idle timeout (~10s) to notice the mic went silent - that
+                    # delay was showing up as a "1011 internal error" log line
+                    # on every single PTT release.
+                    await ws.close()
+                    receiver_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await receiver_task
+        finally:
+            mic.stop()
 
     def stop(self) -> None:
         self._running = False
