@@ -1,0 +1,12 @@
+PyQt6>=6.6.0
+sounddevice>=0.4.6
+numpy>=1.24
+websockets>=12.0
+python-dotenv>=1.0.0
+pywinauto>=0.6.8
+pyautogui>=0.9.54
+opencv-python>=4.9.0.80
+requests>=2.31.0
+
+# Optional local fallback STT (only needed if DEEPGRAM_API_KEY is not set)
+faster-whisper>=1.0.0
