@@ -33,15 +33,20 @@ class Action:
     name: str
     signature: str  # dedup key, e.g. "open_app:arc"
     run: Callable[[], str]  # returns a display label
+    display_arg: str = ""  # human-readable arg for the confirmation badge, e.g. "arc"
 
 
-_APP_WORDS = r"(notes?|arc|terminal|console|cmd|x|twitter|camera|photo\s?booth)"
+# "notepad" must be its own alternative, not just "notes?" (note/notes):
+# "notes?" can't match the "notepad" substring because \b after it fails
+# ("notepad" has no word boundary between "note" and "pad") - this was why
+# "open up notepad" previously matched nothing at all.
+_APP_WORDS = r"(notepad|notes?|arc|terminal|console|cmd|x|twitter|camera|photo\s?booth)"
 
-# Matches "open <app>", "open up <app>", "open the <app>", and "pull up
-# <app>" (with an optional "the" in between). All patterns use .search(), so
-# a leading "can you ..." / "could you ..." filler is already handled
-# without needing to appear in the pattern itself.
-_OPEN_TRIGGER = r"(?:open(?:\s+(?:the|up))?|pull\s+up(?:\s+the)?)"
+# Matches "open <app>", "open up <app>", "open the <app>", "launch <app>",
+# and "pull up <app>" (with an optional "the" in between). All patterns use
+# .search(), so leading/trailing filler ("can you ...", "please ...",
+# "... for me") is already ignored without needing to appear in the pattern.
+_OPEN_TRIGGER = r"(?:open(?:\s+(?:the|up))?|launch(?:\s+the)?|pull\s+up(?:\s+the)?)"
 
 _KNOWN_SEARCH_TARGETS = r"(chrome|edge|arc|firefox|google|x|twitter)"
 
@@ -52,6 +57,7 @@ _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
             name="open_app",
             signature=f"open_app:{m.group(1).lower()}",
             run=lambda: wa.open_app(m.group(1)),
+            display_arg=m.group(1),
         ),
     ),
     (
@@ -60,8 +66,28 @@ _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
             name="navigate_url",
             signature=f"navigate_url:{m.group(1).lower()}",
             run=lambda: wa.navigate_url(m.group(1)),
+            display_arg=m.group(1),
         ),
     ),
+    (
+        re.compile(r"\btake (?:a )?(?:photo|picture|selfie)\b", re.IGNORECASE),
+        lambda m: Action(
+            name="take_photo",
+            signature="take_photo",
+            run=lambda: wa.take_photo_countdown().message,
+        ),
+    ),
+]
+
+# "write <text>" and "search ... for <query>" both capture open-ended,
+# growing free text rather than a fixed short word (like an app name) - firing
+# them mid-sentence (like the patterns above) means every interim update
+# re-fires with a different, incomplete argument: e.g. "search x" -> "search
+# x for" -> "search x for latest news" each produce a distinct dedup
+# signature and were all three observed firing as separate browser searches
+# during live testing. Both are only matched once the utterance is actually
+# done speaking (speech_final), using the final, complete text.
+_FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     (
         # Explicit target named: "search <chrome/arc/x/...> for <query>".
         # "google" is accepted here too even though it isn't a browser app -
@@ -78,6 +104,7 @@ _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
                 query=m.group(2).strip(),
                 browser="default" if m.group(1).lower() == "google" else m.group(1).strip(),
             ),
+            display_arg=m.group(2),
         ),
     ),
     (
@@ -88,24 +115,9 @@ _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
             name="browser_search",
             signature=f"browser_search:default:{m.group(1).lower()}",
             run=lambda: wa.browser_search(query=m.group(1).strip(), browser="default"),
+            display_arg=m.group(1),
         ),
     ),
-    (
-        re.compile(r"\btake (?:a )?(?:photo|picture|selfie)\b", re.IGNORECASE),
-        lambda m: Action(
-            name="take_photo",
-            signature="take_photo",
-            run=lambda: wa.take_photo_countdown().message,
-        ),
-    ),
-]
-
-# "write <text>" is dictation, not a discrete command: the captured text keeps
-# growing on every interim update, so firing it early (like the patterns
-# above) would type overlapping fragments into the target app one after
-# another. It is only matched once the utterance is actually done speaking
-# (speech_final), using the full dictated text.
-_FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     (
         re.compile(r"\bwrite\s+(.+?)(?:[.!?]|$)", re.IGNORECASE),
         lambda m: Action(
@@ -116,12 +128,13 @@ _FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     ),
 ]
 
+# Bracketed, uppercase confirmation-badge style, e.g. "[LAUNCHED NOTEPAD]".
 _ACTION_LABELS = {
-    "open_app": "Opening {arg}...",
-    "navigate_url": "Navigating to {arg}...",
-    "browser_search": "Searching {arg}...",
-    "take_photo": "Capturing photo...",
-    "write_in_app": "Writing...",
+    "open_app": "[LAUNCHED {arg}]",
+    "navigate_url": "[NAVIGATING TO {arg}]",
+    "browser_search": "[SEARCHING FOR {arg}]",
+    "take_photo": "[CAPTURING PHOTO]",
+    "write_in_app": "[WRITING TEXT]",
 }
 
 
@@ -224,16 +237,19 @@ class LLMFallbackClassifier:
         action = data.get("action")
         if action == "open_app":
             app = data["app"]
-            return Action("open_app", f"open_app:{app.lower()}", lambda: wa.open_app(app))
+            return Action("open_app", f"open_app:{app.lower()}", lambda: wa.open_app(app), display_arg=app)
         if action == "navigate_url":
             url = data["url"]
-            return Action("navigate_url", f"navigate_url:{url.lower()}", lambda: wa.navigate_url(url))
+            return Action(
+                "navigate_url", f"navigate_url:{url.lower()}", lambda: wa.navigate_url(url), display_arg=url
+            )
         if action == "browser_search":
             browser, query = data.get("browser", "default"), data["query"]
             return Action(
                 "browser_search",
                 f"browser_search:{browser.lower()}:{query.lower()}",
                 lambda: wa.browser_search(query=query, browser=browser),
+                display_arg=query,
             )
         if action == "take_photo":
             return Action("take_photo", "take_photo", lambda: wa.take_photo_countdown().message)
@@ -267,17 +283,16 @@ class IntentEngine:
 
         if action is None:
             return
-        # Same reasoning as _FINAL_ONLY_PATTERNS: dictation must not fire on
-        # a growing partial transcript, regardless of which matcher found it.
-        if action.name == "write_in_app" and not speech_final:
+        # Same reasoning as _FINAL_ONLY_PATTERNS: open-ended captured text
+        # (dictation, search queries) must not fire on a growing partial
+        # transcript, regardless of which matcher (regex or LLM) found it.
+        if action.name in ("write_in_app", "browser_search") and not speech_final:
             return
         if self._already_fired(utterance_id, action.signature):
             return
 
         self._mark_fired(utterance_id, action.signature)
-        label = _ACTION_LABELS.get(action.name, "Working...").format(
-            arg=action.signature.split(":", 1)[-1] if ":" in action.signature else ""
-        )
+        label = _ACTION_LABELS.get(action.name, "[WORKING]").format(arg=action.display_arg.upper())
         self._on_action_started(label)
         self._executor.submit(self._execute, action, label)
 

@@ -46,12 +46,15 @@ SCRIPT: list[tuple[int, str, bool, bool, int]] = [
     (400, "hey can you open arc for", False, False, 0),
     (300, "hey can you open arc for me", True, True, 0),  # finalized: must NOT refire
 
+    # "search" only fires on speech_final, not mid-sentence: the query is
+    # open-ended growing text, so firing early ("search x" -> "search x
+    # for" -> ...) would trigger a separate, incomplete search each time.
     (900, "then", False, False, 1),
     (250, "then search", False, False, 1),
     (250, "then search x", False, False, 1),
     (300, "then search x for", False, False, 1),
-    (350, "then search x for latest ai news", False, False, 1),  # <- fires here
-    (400, "then search x for latest ai news", True, True, 1),
+    (350, "then search x for latest ai news", False, False, 1),
+    (400, "then search x for latest ai news", True, True, 1),  # <- fires here (once)
 
     (900, "now", False, False, 2),
     (250, "now take", False, False, 2),
@@ -64,6 +67,21 @@ SCRIPT: list[tuple[int, str, bool, bool, int]] = [
     (300, "write hello from", False, False, 3),
     (400, "write hello from the voice assistant demo", False, False, 3),  # <- fires here
     (300, "write hello from the voice assistant demo", True, True, 3),
+
+    (900, "hey", False, False, 4),
+    (250, "hey can you", False, False, 4),
+    (250, "hey can you please", False, False, 4),
+    (250, "hey can you please open up", False, False, 4),
+    (300, "hey can you please open up notepad", False, False, 4),  # <- fires here (regression: "notepad" previously unmatched)
+    (400, "hey can you please open up notepad for me", True, True, 4),
+
+    (900, "launch", False, False, 5),
+    (300, "launch terminal", False, False, 5),  # <- fires here ("launch" as a trigger verb)
+    (300, "launch terminal", True, True, 5),
+
+    (900, "please search", False, False, 6),
+    (300, "please search for the latest ai news", False, False, 6),
+    (300, "please search for the latest ai news", True, True, 6),  # <- fires here (no named target)
 ]
 
 
@@ -71,6 +89,7 @@ def run() -> int:
     app = QApplication(sys.argv)
     overlay = PillOverlay()
     overlay.show()
+    overlay.flash_active()  # exercise the instant cyan "ANIMUS LISTENING" pop
     overlay.set_listening(True)
 
     fired_log: list[str] = []
