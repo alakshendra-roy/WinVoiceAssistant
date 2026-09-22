@@ -182,6 +182,7 @@ def open_app(app_name: str) -> str:
 
 # Modifier virtual-key codes: generic + left/right variants for Alt, Ctrl, Shift.
 _MODIFIER_VKS = (0x12, 0xA4, 0xA5, 0x11, 0xA2, 0xA3, 0x10, 0xA0, 0xA1)
+_KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP = 0x0002
 
 
@@ -193,12 +194,20 @@ def _release_modifier_keys() -> None:
     injected letter is read as an Alt+<letter> accelerator instead of typed
     text - in a tabbed app like modern Notepad this drove File-menu/Open
     behavior and pulled in unrelated recently-used files, not just opened a
-    menu. keybd_event KEYUP is sent unconditionally; releasing an
-    already-up key is a harmless no-op, so this is safe to call regardless
-    of actual physical key state.
+    menu.
+
+    Right-side modifiers (Right Alt, Right Ctrl) are "extended" keys - a
+    KEYUP without KEYEVENTF_EXTENDEDKEY set doesn't reliably clear the same
+    internal state that a real (or pynput-synthesized) press of the
+    extended key set, confirmed by a follow-up repro where a single
+    unflagged KEYUP left the paste still going nowhere. Sending both
+    variants for every vk covers whichever one is actually the active bit,
+    since releasing an already-up key is a harmless no-op regardless of
+    flags.
     """
     for vk in _MODIFIER_VKS:
         ctypes.windll.user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
+        ctypes.windll.user32.keybd_event(vk, 0, _KEYEVENTF_EXTENDEDKEY | _KEYEVENTF_KEYUP, 0)
 
 
 def _get_clipboard_text() -> Optional[str]:
@@ -279,6 +288,13 @@ def write_in_app(text: str, title: Optional[str] = None) -> str:
         pass
     window.set_focus()
     time.sleep(0.05)
+    # A held Alt can leave the window in menu/accelerator-navigation mode
+    # even after the OS's own modifier key-state is cleared - confirmed via
+    # a follow-up repro where the paste still landed nowhere despite
+    # _release_modifier_keys(). Escape is the standard way to force a
+    # window out of that mode regardless of which input subsystem (classic
+    # Win32 vs. a modern app's own accelerator handling) is tracking it.
+    window.type_keys("{ESC}", pause=0)
 
     if title is None:
         window.type_keys("^t", pause=0)  # new blank tab - never paste into an ambient real file
@@ -289,6 +305,7 @@ def write_in_app(text: str, title: Optional[str] = None) -> str:
     # own Alt keypress internally to defeat the foreground-lock, so the
     # earlier release alone isn't guaranteed to still hold by this point.
     _release_modifier_keys()
+    window.type_keys("{ESC}", pause=0)
 
     previous_clipboard = _get_clipboard_text()
     _set_clipboard_text(text)
