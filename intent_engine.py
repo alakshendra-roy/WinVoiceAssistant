@@ -37,9 +37,15 @@ class Action:
 
 _APP_WORDS = r"(notes?|arc|terminal|console|cmd|x|twitter|camera|photo\s?booth)"
 
+# Matches "open <app>", "open up <app>", "open the <app>", and "pull up
+# <app>" (with an optional "the" in between). All patterns use .search(), so
+# a leading "can you ..." / "could you ..." filler is already handled
+# without needing to appear in the pattern itself.
+_OPEN_TRIGGER = r"(?:open(?:\s+(?:the|up))?|pull\s+up(?:\s+the)?)"
+
 _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     (
-        re.compile(rf"\bopen (?:the |up )?{_APP_WORDS}\b", re.IGNORECASE),
+        re.compile(rf"\b{_OPEN_TRIGGER}\s+{_APP_WORDS}\b", re.IGNORECASE),
         lambda m: Action(
             name="open_app",
             signature=f"open_app:{m.group(1).lower()}",
